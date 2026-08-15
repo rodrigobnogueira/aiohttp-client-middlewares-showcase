@@ -1,0 +1,2 @@
+aiohttp-client-middlewares @ git+https://github.com/aio-libs/aiohttp-client-middlewares@master
+aiohttp>=3.12
