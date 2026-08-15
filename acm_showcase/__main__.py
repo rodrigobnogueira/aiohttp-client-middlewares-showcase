@@ -40,9 +40,9 @@ async def main(groups: set[str]) -> int:
     print(f"\n{total - len(failures)}/{total} scenarios passed")
     if failures:
         print(f"\n{BOLD}Tracebacks{OFF}")
-        for group, name, exc in failures:
+        for group, name, failure in failures:
             print(f"\n{RED}{group} / {name}{OFF}")
-            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            traceback.print_exception(type(failure), failure, failure.__traceback__)
     return 1 if failures else 0
 
 

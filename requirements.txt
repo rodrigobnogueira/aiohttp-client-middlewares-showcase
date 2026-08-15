@@ -1,2 +1,2 @@
-aiohttp-client-middlewares @ git+https://github.com/aio-libs/aiohttp-client-middlewares@master
+aiohttp-client-middlewares @ git+https://github.com/aio-libs/aiohttp-client-middlewares@split-rate-limiter-abc
 aiohttp>=3.12

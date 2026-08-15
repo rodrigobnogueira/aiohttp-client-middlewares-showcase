@@ -21,5 +21,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e .
+      - run: pip install -e . mypy
       - run: python -m acm_showcase
+      - run: mypy

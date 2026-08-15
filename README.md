@@ -35,8 +35,20 @@ python -m acm_showcase            # everything
 python -m acm_showcase digest     # one group: digest, rate-limit, combined
 ```
 
-`pyproject.toml` pins the library to `master`, since the rate-limiting
-middleware is not in a release yet. Point it at a tag once one exists.
+`pyproject.toml` pins the library to the `split-rate-limiter-abc` branch
+behind [aio-libs/aiohttp-client-middlewares#25][pr25], not to `master` and
+not to a release. Nothing is released yet, and the point of this repository
+is to exercise the API *before* it ships: the rate-limiting scenarios below
+cover the two-base-class design that PR proposes. Repoint it at `master`
+once #25 lands, and at a tag once one exists.
+
+[pr25]: https://github.com/aio-libs/aiohttp-client-middlewares/pull/25
+
+`mypy --strict` runs over the package as part of CI. That is not decoration:
+`acm_showcase/typing_usage.py` exists only to be type-checked, because the
+library's annotations can be wrong in ways no amount of running catches --
+an inherited `clone()` returning the base type works perfectly at runtime
+and only bites a caller who annotated something.
 
 ## What it covers
 
@@ -47,11 +59,17 @@ on and off, counting challenges to prove the difference; a nonce ageing out
 mid-session; a wrong password terminating instead of looping; and credentials
 staying scoped to the origin they were first used against.
 
-**Rate limiting** — burst then throttle; `per_domain` on and off; the
-caller's own limiter being the one used rather than a copy; a custom
-`RateLimiter` subclass driving the middleware; `release()` returning a slot
-whose caller was cancelled mid-sleep; `clone()` producing independent state;
-and every invalid configuration being rejected at construction.
+**Rate limiting**, against the #25 design — burst then throttle;
+`per_domain` on and off; the caller's own limiter being used rather than a
+copy; a custom `SyncRateLimiter` driving the middleware; an I/O-backed
+`RateLimiter` that implements `wait()` **and nothing else**, asserting that
+`acquire()` and `release()` are not even present on that path; the Redis
+sketch from the library's own docs run against a fake Redis; an awaiting
+limiter raising past its timeout; `release()` returning a slot cancelled
+mid-sleep; `clone()` producing independent state *and* keeping the caller's
+type, including through `per_domain`; the pre-split shape failing loudly at
+construction rather than misbehaving later; and every invalid configuration
+rejected up front.
 
 **Both together** — digest listed before rate limiting, so an authentication
 replay is throttled too, which is the ordering the library's own docs

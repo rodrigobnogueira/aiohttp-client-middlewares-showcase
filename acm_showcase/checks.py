@@ -15,6 +15,7 @@ from aiohttp_client_middlewares import (
     DigestAuthMiddleware,
     RateLimiter,
     RateLimitMiddleware,
+    SyncRateLimiter,
     TokenBucket,
 )
 
@@ -267,11 +268,11 @@ async def rate_limiter_identity() -> str:
     return "limiter used directly, not copied"
 
 
-@scenario("rate-limit", "a custom RateLimiter subclass drives the middleware")
-async def rate_custom_limiter() -> str:
-    calls: list[float | None] = []
+@scenario("rate-limit", "a custom SyncRateLimiter drives the middleware")
+async def rate_custom_sync_limiter() -> str:
+    calls: list[None] = []
 
-    class Recording(RateLimiter):
+    class Recording(SyncRateLimiter):
         def acquire(self) -> float:
             calls.append(None)
             return 0.0
@@ -289,6 +290,150 @@ async def rate_custom_limiter() -> str:
     if len(calls) != 3:
         raise AssertionError(f"expected 3 acquires, saw {len(calls)}")
     return f"{len(calls)} acquires through a custom limiter"
+
+
+@scenario("rate-limit", "a sync limiter left on RateLimiter fails loudly")
+async def rate_migration_break() -> str:
+    """What the upgrade note promises, as a running program.
+
+    Before the split this class was valid. It now names no ``wait()``, so
+    it cannot be instantiated at all rather than misbehaving at runtime.
+    """
+
+    class NotMigrated(RateLimiter):
+        def acquire(self) -> float:
+            return 0.0
+
+        def clone(self) -> "NotMigrated":
+            raise NotImplementedError
+
+    try:
+        NotMigrated()  # type: ignore[abstract]
+    except TypeError as exc:
+        if "wait" not in str(exc):
+            raise AssertionError(f"unhelpful error: {exc}") from None
+        return "TypeError naming wait(), at construction"
+    raise AssertionError("a limiter without wait() was accepted")
+
+
+@scenario("rate-limit", "an I/O-backed limiter implements wait() and nothing else")
+async def rate_async_limiter_minimal() -> str:
+    seen: list[float | None] = []
+
+    class Awaiting(RateLimiter):
+        async def wait(self, timeout: float | None = None) -> None:
+            seen.append(timeout)
+            await asyncio.sleep(0)
+
+        def clone(self) -> "Awaiting":
+            return Awaiting()
+
+    limiter = Awaiting()
+    for absent in ("acquire", "release"):
+        if hasattr(limiter, absent):
+            raise AssertionError(f"{absent}() should not exist on this path")
+
+    log: list[float] = []
+    async with _Server(_echo_app(log)) as site:
+        async with aiohttp.ClientSession(
+            middlewares=(RateLimitMiddleware(limiter),)
+        ) as session:
+            for _ in range(3):
+                async with session.get(f"{site.url}/x") as resp:
+                    assert resp.status == 200
+    if len(seen) != 3:
+        raise AssertionError(f"expected 3 waits, saw {len(seen)}")
+    return f"{len(seen)} requests, no acquire()/release() in sight"
+
+
+@scenario("rate-limit", "the documented Redis sketch, against a fake Redis")
+async def rate_redis_sketch() -> str:
+    """The example from the docs, run rather than read.
+
+    The fake holds one key with an expiry, which is all the sketch relies
+    on, so this exercises the real control flow: contend, poll, proceed.
+    """
+
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.held_until = 0.0
+            self.sets = 0
+
+        async def set(self, key: str, value: str, nx: bool = False, ex: int = 0) -> bool:
+            self.sets += 1
+            now = time.monotonic()
+            if nx and now < self.held_until:
+                return False
+            self.held_until = now + (ex or 0) * 0.05  # scaled down for the demo
+            return True
+
+    class RedisLimiter(RateLimiter):
+        def __init__(self, redis: FakeRedis, key: str) -> None:
+            self._redis, self._key = redis, key
+
+        async def _reserve(self) -> None:
+            while not await self._redis.set(self._key, "1", nx=True, ex=1):
+                await asyncio.sleep(0.01)
+
+        async def wait(self, timeout: float | None = None) -> None:
+            await asyncio.wait_for(self._reserve(), timeout)
+
+        def clone(self) -> "RedisLimiter":
+            return RedisLimiter(self._redis, self._key)
+
+    redis = FakeRedis()
+    log: list[float] = []
+    async with _Server(_echo_app(log)) as site:
+        middleware = RateLimitMiddleware(RedisLimiter(redis, "rate:showcase"))
+        async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
+            start = time.monotonic()
+            for _ in range(4):
+                async with session.get(f"{site.url}/x") as resp:
+                    assert resp.status == 200
+            elapsed = time.monotonic() - start
+    if redis.sets < 4:
+        raise AssertionError(f"the limiter did not reserve per request: {redis.sets}")
+    return f"4 requests in {elapsed * 1000:.0f} ms, {redis.sets} reservations"
+
+
+@scenario("rate-limit", "an awaiting limiter raises past its timeout")
+async def rate_async_limiter_timeout() -> str:
+    class NeverFree(RateLimiter):
+        async def wait(self, timeout: float | None = None) -> None:
+            await asyncio.wait_for(asyncio.Event().wait(), timeout)
+
+        def clone(self) -> "NeverFree":
+            return NeverFree()
+
+    start = time.monotonic()
+    try:
+        await NeverFree().wait(timeout=0.1)
+    except asyncio.TimeoutError:
+        return f"asyncio.TimeoutError after {(time.monotonic() - start) * 1000:.0f} ms"
+    raise AssertionError("a limiter that never frees a slot returned anyway")
+
+
+@scenario("rate-limit", "clone() keeps the caller's type, including per-domain")
+async def rate_clone_type() -> str:
+    limiter: SyncRateLimiter = TokenBucket(rate=10.0, burst=1)
+    fresh = limiter.clone()
+    # acquire() and release() have to survive the clone, or the upgrade
+    # note's advice to hold a limiter as SyncRateLimiter would not work.
+    if not isinstance(fresh, TokenBucket):
+        raise AssertionError(f"clone returned {type(fresh).__name__}")
+    fresh.acquire()
+    fresh.release()
+
+    log: list[float] = []
+    async with _Server(_echo_app(log)) as site:
+        middleware = RateLimitMiddleware(TokenBucket(rate=50.0, burst=1), per_domain=True)
+        async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
+            async with session.get(f"{site.url}/x") as resp:
+                assert resp.status == 200
+        cloned = middleware._domain_limiters["127.0.0.1"]
+    if not isinstance(cloned, TokenBucket):
+        raise AssertionError(f"per-domain clone is {type(cloned).__name__}")
+    return "clone is a TokenBucket, with acquire() and release() intact"
 
 
 @scenario("rate-limit", "release() returns a slot cancelled mid-sleep")

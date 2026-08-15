@@ -9,8 +9,12 @@ description = "A runnable exercise of every feature in aiohttp-client-middleware
 requires-python = ">=3.10"
 dependencies = [
   "aiohttp>=3.12",
-  "aiohttp-client-middlewares @ git+https://github.com/aio-libs/aiohttp-client-middlewares@master",
+  "aiohttp-client-middlewares @ git+https://github.com/aio-libs/aiohttp-client-middlewares@split-rate-limiter-abc",
 ]
 
 [tool.setuptools.packages.find]
 include = ["acm_showcase*"]
+
+[tool.mypy]
+strict = true
+files = ["acm_showcase"]
