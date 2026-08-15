@@ -226,18 +226,21 @@ async def rate_per_domain() -> str:
     async with _Server(_echo_app(log)) as site:
         port = site.url.rsplit(":", 1)[1]
         # Limiters are keyed on the host string alone, so these two URLs are
-        # the same server but different buckets.
-        first, second = f"http://127.0.0.1:{port}/x", f"http://localhost:{port}/x"
+        # the same server but must land in different buckets.
+        urls = (f"http://127.0.0.1:{port}/x", f"http://localhost:{port}/x")
         middleware = RateLimitMiddleware(TokenBucket(rate=10.0, burst=1), per_domain=True)
         async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
-            start = time.monotonic()
-            for url in (first, second):
+            for url in urls:
                 async with session.get(url) as resp:
                     assert resp.status == 200
-            elapsed = time.monotonic() - start
-    if elapsed > 0.05:
-        raise AssertionError(f"hosts appear to share a bucket: {elapsed:.3f}s")
-    return f"2 host names, {elapsed * 1000:.0f} ms"
+        # Assert the structure rather than the clock: connection latency to
+        # "localhost" varies by host and would masquerade as throttling.
+        buckets = middleware._domain_limiters
+        if set(buckets) != {"127.0.0.1", "localhost"}:
+            raise AssertionError(f"expected one bucket per host, got {sorted(buckets)}")
+        if buckets["127.0.0.1"] is buckets["localhost"]:
+            raise AssertionError("both hosts share a limiter instance")
+    return f"{len(buckets)} independent buckets: {', '.join(sorted(buckets))}"
 
 
 @scenario("rate-limit", "per_domain=False shares one budget")

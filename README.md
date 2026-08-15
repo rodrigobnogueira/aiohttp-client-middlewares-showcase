@@ -91,7 +91,10 @@ that a change in either direction is visible.
 **Per-domain limiters are keyed on the host string alone.** `127.0.0.1` and
 `localhost` get separate buckets even when they are the same server, and two
 ports on one host share one. That is documented, and worth knowing before
-relying on `per_domain=True` to isolate anything.
+relying on `per_domain=True` to isolate anything. The scenario asserts the
+limiter registry rather than timing the requests, because connection latency
+to `localhost` varies by machine and would otherwise masquerade as
+throttling — which is exactly how it first failed on CI.
 
 ## Layout
 
