@@ -20,7 +20,7 @@ digest
         auth, auth-int, absent
   ...
 
-17/17 scenarios passed
+24/24 scenarios passed
 ```
 
 The process exits non-zero if anything fails, so it works as a smoke test in
@@ -35,12 +35,12 @@ python -m acm_showcase            # everything
 python -m acm_showcase digest     # one group: digest, rate-limit, combined
 ```
 
-`pyproject.toml` pins the library to the `split-rate-limiter-abc` branch
-behind [aio-libs/aiohttp-client-middlewares#25][pr25], not to `master` and
-not to a release. Nothing is released yet, and the point of this repository
-is to exercise the API *before* it ships: the rate-limiting scenarios below
-cover the two-base-class design that PR proposes. Repoint it at `master`
-once #25 lands, and at a tag once one exists.
+`pyproject.toml` and `requirements.txt` pin the library to `master`, not to a
+release: nothing is released yet, and the point of this repository is to
+exercise the API as it stands. The rate-limiting scenarios below track
+[aio-libs/aiohttp-client-middlewares#25][pr25], which made `acquire()` a
+coroutine and left a single `RateLimiter` base class. Repoint at a tag once
+one exists.
 
 [pr25]: https://github.com/aio-libs/aiohttp-client-middlewares/pull/25
 
@@ -48,7 +48,9 @@ once #25 lands, and at a tag once one exists.
 `acm_showcase/typing_usage.py` exists only to be type-checked, because the
 library's annotations can be wrong in ways no amount of running catches --
 an inherited `clone()` returning the base type works perfectly at runtime
-and only bites a caller who annotated something.
+and only bites a caller who annotated something. Where a claim there is
+about what mypy *rejects*, the `type: ignore` is the assertion: `--strict`
+fails on an unused one, so the claim cannot quietly stop being true.
 
 ## What it covers
 
@@ -59,17 +61,19 @@ on and off, counting challenges to prove the difference; a nonce ageing out
 mid-session; a wrong password terminating instead of looping; and credentials
 staying scoped to the origin they were first used against.
 
-**Rate limiting**, against the #25 design — burst then throttle;
-`per_domain` on and off; the caller's own limiter being used rather than a
-copy; a custom `SyncRateLimiter` driving the middleware; an I/O-backed
-`RateLimiter` that implements `wait()` **and nothing else**, asserting that
-`acquire()` and `release()` are not even present on that path; the Redis
-sketch from the library's own docs run against a fake Redis; an awaiting
-limiter raising past its timeout; `release()` returning a slot cancelled
-mid-sleep; `clone()` producing independent state *and* keeping the caller's
-type, including through `per_domain`; the pre-split shape failing loudly at
-construction rather than misbehaving later; and every invalid configuration
-rejected up front.
+**Rate limiting** — burst then throttle; `per_domain` on and off; the
+caller's own limiter being used rather than a copy; a limiter that is
+`acquire()` and `clone()` **and nothing else**, with `wait()` and `release()`
+inherited unchanged from the base; an I/O-backed limiter that awaits a real
+HTTP round trip *inside* `acquire()` and is driven end to end through the
+middleware; the Redis sketch from the library's own docs run against a fake
+Redis; the timeout contract three ways — time spent acquiring charged against
+the caller's budget, a delay past that budget refused up front instead of
+slept, and a hanging `acquire()` that no timeout handed to `wait()` can stop;
+a half-migrated synchronous `acquire()` passing the ABC and failing on first
+use; `release()` returning a slot cancelled mid-sleep; `clone()` yielding
+independent state and a fresh instance of the caller's own class, including
+through `per_domain`; and every invalid configuration rejected up front.
 
 **Both together** — digest listed before rate limiting, so an authentication
 replay is throttled too, which is the ordering the library's own docs
@@ -102,6 +106,7 @@ throttling — which is exactly how it first failed on CI.
 | --- | --- |
 | `acm_showcase/digest_server.py` | A configurable RFC 7616 digest server. Algorithm, `qop`, `realm`, `domain` and nonce expiry are all constructor arguments. |
 | `acm_showcase/checks.py` | The scenarios, one function each, registered with a decorator. |
+| `acm_showcase/typing_usage.py` | Typed usage nothing imports, there to be checked by `mypy --strict`. |
 | `acm_showcase/__main__.py` | Runs them and reports. |
 
 Adding a scenario is one decorated coroutine that returns a short string on

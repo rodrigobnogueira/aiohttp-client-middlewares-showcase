@@ -7,7 +7,7 @@ a named scenario rather than a stack trace in the middle of a demo.
 
 import asyncio
 import time
-from typing import AsyncIterator, Awaitable, Callable
+from typing import Awaitable, Callable
 
 import aiohttp
 from aiohttp import web
@@ -15,7 +15,6 @@ from aiohttp_client_middlewares import (
     DigestAuthMiddleware,
     RateLimiter,
     RateLimitMiddleware,
-    SyncRateLimiter,
     TokenBucket,
 )
 
@@ -271,17 +270,28 @@ async def rate_limiter_identity() -> str:
     return "limiter used directly, not copied"
 
 
-@scenario("rate-limit", "a custom SyncRateLimiter drives the middleware")
-async def rate_custom_sync_limiter() -> str:
+@scenario("rate-limit", "a limiter is acquire() and clone(); the rest is inherited")
+async def rate_custom_limiter() -> str:
+    """The whole surface a custom algorithm has to write.
+
+    ``wait()`` and ``release()`` are concrete on the base, so an algorithm
+    that has nothing to add to either says nothing about them, and the
+    sleeping, timeout and cancellation logic is the library's rather than
+    copied into every implementation.
+    """
     calls: list[None] = []
 
-    class Recording(SyncRateLimiter):
-        def acquire(self) -> float:
+    class Recording(RateLimiter):
+        async def acquire(self) -> float:
             calls.append(None)
             return 0.0
 
         def clone(self) -> "Recording":
             return Recording()
+
+    for shared in ("wait", "release"):
+        if getattr(Recording, shared) is not getattr(RateLimiter, shared):
+            raise AssertionError(f"{shared}() is not the inherited one")
 
     log: list[float] = []
     async with _Server(_echo_app(log)) as site:
@@ -292,157 +302,240 @@ async def rate_custom_sync_limiter() -> str:
                     assert resp.status == 200
     if len(calls) != 3:
         raise AssertionError(f"expected 3 acquires, saw {len(calls)}")
-    return f"{len(calls)} acquires through a custom limiter"
+    return f"{len(calls)} acquires through a limiter of two methods"
 
 
-@scenario("rate-limit", "a sync limiter left on RateLimiter fails loudly")
-async def rate_migration_break() -> str:
-    """What the upgrade note promises, as a running program.
+@scenario("rate-limit", "an I/O-backed limiter awaits inside acquire()")
+async def rate_io_backed_acquire() -> str:
+    """What an async ``acquire()`` buys: reserving a slot may do I/O.
 
-    Before the split this class was valid. It now names no ``wait()``, so
-    it cannot be instantiated at all rather than misbehaving at runtime.
+    A quota service on its own port hands out delays over HTTP, so this
+    limiter suspends in the middle of reserving -- which a synchronous
+    ``acquire()`` could not express without blocking the loop. Everything
+    after the reservation is the library's: ``wait()`` sleeps the delay it
+    is handed, the middleware holds the request until it returns.
     """
+    granted: list[float] = []
 
-    class NotMigrated(RateLimiter):
-        def acquire(self) -> float:
-            return 0.0
+    async def reserve(request: web.Request) -> web.Response:
+        # Two slots free, then one every 50 ms.
+        delay = 0.0 if len(granted) < 2 else 0.05
+        granted.append(delay)
+        return web.json_response({"delay": delay})
 
-        def clone(self) -> "NotMigrated":
-            raise NotImplementedError
+    quota_app = web.Application()
+    quota_app.router.add_get("/reserve", reserve)
 
-    try:
-        NotMigrated()  # type: ignore[abstract]
-    except TypeError as exc:
-        if "wait" not in str(exc):
-            raise AssertionError(f"unhelpful error: {exc}") from None
-        return "TypeError naming wait(), at construction"
-    raise AssertionError("a limiter without wait() was accepted")
+    class RemoteQuota(RateLimiter):
+        """Reserves every slot over a real socket."""
 
+        def __init__(self, client: aiohttp.ClientSession, url: str) -> None:
+            self._client, self._url = client, url
 
-@scenario("rate-limit", "an I/O-backed limiter implements wait() and nothing else")
-async def rate_async_limiter_minimal() -> str:
-    seen: list[float | None] = []
+        async def acquire(self) -> float:
+            async with self._client.get(self._url) as resp:
+                payload = await resp.json()
+            return float(payload["delay"])
 
-    class Awaiting(RateLimiter):
-        async def wait(self, timeout: float | None = None) -> None:
-            seen.append(timeout)
-            await asyncio.sleep(0)
-
-        def clone(self) -> "Awaiting":
-            return Awaiting()
-
-    limiter = Awaiting()
-    for absent in ("acquire", "release"):
-        if hasattr(limiter, absent):
-            raise AssertionError(f"{absent}() should not exist on this path")
+        def clone(self) -> "RemoteQuota":
+            return RemoteQuota(self._client, self._url)
 
     log: list[float] = []
-    async with _Server(_echo_app(log)) as site:
-        async with aiohttp.ClientSession(
-            middlewares=(RateLimitMiddleware(limiter),)
-        ) as session:
-            for _ in range(3):
-                async with session.get(f"{site.url}/x") as resp:
-                    assert resp.status == 200
-    if len(seen) != 3:
-        raise AssertionError(f"expected 3 waits, saw {len(seen)}")
-    return f"{len(seen)} requests, no acquire()/release() in sight"
+    async with _Server(quota_app) as quota, _Server(_echo_app(log)) as site:
+        async with aiohttp.ClientSession() as quota_client:
+            limiter = RemoteQuota(quota_client, f"{quota.url}/reserve")
+            middleware = RateLimitMiddleware(limiter)
+            async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
+                start = time.monotonic()
+                for _ in range(4):
+                    async with session.get(f"{site.url}/x") as resp:
+                        assert resp.status == 200
+                elapsed = time.monotonic() - start
+    if len(granted) != 4:
+        raise AssertionError(f"expected 4 remote reservations, saw {len(granted)}")
+    if len(log) != 4:
+        raise AssertionError(f"expected 4 requests through, saw {len(log)}")
+    # Two free then 2 x 50 ms: the delays the service dictated were slept.
+    if elapsed < 0.09:
+        raise AssertionError(f"the granted delays were not slept: {elapsed:.3f}s")
+    return f"4 requests, 4 reservations over HTTP, {elapsed * 1000:.0f} ms"
 
 
 @scenario("rate-limit", "the documented Redis sketch, against a fake Redis")
 async def rate_redis_sketch() -> str:
     """The example from the docs, run rather than read.
 
-    The fake holds one key with an expiry, which is all the sketch relies
-    on, so this exercises the real control flow: contend, poll, proceed.
+    The fake keeps what the sketch relies on: one key, one atomic script,
+    and a delay returned in whole milliseconds, because Redis turns Lua
+    numbers into integers and a fractional second cannot come back as one.
     """
 
     class FakeRedis:
-        def __init__(self) -> None:
-            self.held_until = 0.0
-            self.sets = 0
+        def __init__(self, interval_ms: int) -> None:
+            self._interval_ms = interval_ms
+            self._next: dict[str, float] = {}
+            self.evaluations = 0
 
-        async def set(self, key: str, value: str, nx: bool = False, ex: int = 0) -> bool:
-            self.sets += 1
-            now = time.monotonic()
-            if nx and now < self.held_until:
-                return False
-            self.held_until = now + (ex or 0) * 0.05  # scaled down for the demo
-            return True
+        async def evalsha(self, script: str, numkeys: int, key: str) -> int:
+            """Reserve the next slot for ``key`` and return its delay in ms."""
+            self.evaluations += 1
+            now = time.monotonic() * 1000
+            due = max(self._next.get(key, now), now)
+            self._next[key] = due + self._interval_ms
+            return int(due - now)
 
     class RedisLimiter(RateLimiter):
-        def __init__(self, redis: FakeRedis, key: str) -> None:
-            self._redis, self._key = redis, key
+        def __init__(self, redis: FakeRedis, key: str, script: str) -> None:
+            self._redis, self._key, self._script = redis, key, script
 
-        async def _reserve(self) -> None:
-            while not await self._redis.set(self._key, "1", nx=True, ex=1):
-                await asyncio.sleep(0.01)
-
-        async def wait(self, timeout: float | None = None) -> None:
-            await asyncio.wait_for(self._reserve(), timeout)
+        async def acquire(self) -> float:
+            ms = await self._redis.evalsha(self._script, 1, self._key)
+            return ms / 1000
 
         def clone(self) -> "RedisLimiter":
-            return RedisLimiter(self._redis, self._key)
+            return RedisLimiter(self._redis, self._key, self._script)
 
-    redis = FakeRedis()
+    redis = FakeRedis(interval_ms=50)
     log: list[float] = []
     async with _Server(_echo_app(log)) as site:
-        middleware = RateLimitMiddleware(RedisLimiter(redis, "rate:showcase"))
+        limiter = RedisLimiter(redis, "rate:showcase", "deadbeef")
+        middleware = RateLimitMiddleware(limiter)
         async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
             start = time.monotonic()
             for _ in range(4):
                 async with session.get(f"{site.url}/x") as resp:
                     assert resp.status == 200
             elapsed = time.monotonic() - start
-    if redis.sets < 4:
-        raise AssertionError(f"the limiter did not reserve per request: {redis.sets}")
-    return f"4 requests in {elapsed * 1000:.0f} ms, {redis.sets} reservations"
+    if redis.evaluations != 4:
+        raise AssertionError(f"expected one script call per request, saw {redis.evaluations}")
+    # First slot is now, the other three are one 50 ms interval apart.
+    if elapsed < 0.1:
+        raise AssertionError(f"the script's delays were not slept: {elapsed:.3f}s")
+    return f"4 requests in {elapsed * 1000:.0f} ms, {redis.evaluations} reservations"
 
 
-@scenario("rate-limit", "an awaiting limiter raises past its timeout")
-async def rate_async_limiter_timeout() -> str:
-    class NeverFree(RateLimiter):
-        async def wait(self, timeout: float | None = None) -> None:
-            await asyncio.wait_for(asyncio.Event().wait(), timeout)
+@scenario("rate-limit", "time spent in acquire() is charged against the timeout")
+async def rate_acquire_charged() -> str:
+    """A slow reservation spends the caller's budget, and ``wait()`` counts it.
 
-        def clone(self) -> "NeverFree":
-            return NeverFree()
+    Reserving takes 50 ms and then asks for a 60 ms sleep. Against a 100 ms
+    timeout the sleep alone would fit and the request would still time out
+    on the wire; charging the reservation makes ``wait()`` say so up front.
+    Given 500 ms the same limiter sleeps and returns.
+    """
+
+    class SlowReservation(RateLimiter):
+        async def acquire(self) -> float:
+            await asyncio.sleep(0.05)
+            return 0.06
+
+        def clone(self) -> "SlowReservation":
+            return SlowReservation()
 
     start = time.monotonic()
     try:
-        await NeverFree().wait(timeout=0.1)
+        await SlowReservation().wait(timeout=0.1)
+    except asyncio.TimeoutError as exc:
+        refused_after, message = time.monotonic() - start, str(exc)
+    else:
+        raise AssertionError("the time spent acquiring was not charged")
+    if "remaining timeout" not in message:
+        raise AssertionError(f"unhelpful error: {message}")
+
+    start = time.monotonic()
+    await SlowReservation().wait(timeout=0.5)
+    served = time.monotonic() - start
+    if served < 0.1:
+        raise AssertionError(f"the returned delay was not slept: {served:.3f}s")
+    return f"refused after {refused_after * 1000:.0f} ms, served in {served * 1000:.0f} ms"
+
+
+@scenario("rate-limit", "a delay past the timeout is refused, not slept")
+async def rate_timeout_refuses_up_front() -> str:
+    bucket = TokenBucket(rate=5.0, burst=1)
+    await bucket.acquire()  # drain the burst: the next caller owes 200 ms
+    start = time.monotonic()
+    try:
+        await bucket.wait(timeout=0.05)
+    except asyncio.TimeoutError as exc:
+        elapsed, message = time.monotonic() - start, str(exc)
+    else:
+        raise AssertionError("a 200 ms delay was accepted against a 50 ms timeout")
+    if elapsed > 0.1:
+        raise AssertionError(f"it slept toward the timeout first: {elapsed:.3f}s")
+    if "0.200s" not in message:
+        raise AssertionError(f"the error does not name the delay refused: {message}")
+    # The refused slot went back, so the next caller owes one interval, not two.
+    owed = await bucket.acquire()
+    if owed > 0.25:
+        raise AssertionError(f"the refused slot was not returned: {owed:.3f}s")
+    return f"refused in {elapsed * 1000:.1f} ms; next caller owes {owed:.3f}s"
+
+
+@scenario("rate-limit", "a hanging acquire() outlives the timeout given to wait()")
+async def rate_acquire_is_unbounded() -> str:
+    """Documented, and worth seeing run: the budget covers the delay, not the call.
+
+    ``wait()`` charges what acquiring took but cannot interrupt it, so a
+    limiter whose backend stops answering hangs the request no matter what
+    timeout it was handed. Anything reaching over a network inside
+    ``acquire()`` needs a deadline of its own; here the caller's is the only
+    one that ever fires.
+    """
+
+    class NeverAnswers(RateLimiter):
+        async def acquire(self) -> float:
+            await asyncio.Event().wait()
+            return 0.0
+
+        def clone(self) -> "NeverAnswers":
+            return NeverAnswers()
+
+    start = time.monotonic()
+    try:
+        await asyncio.wait_for(NeverAnswers().wait(timeout=0.02), timeout=0.2)
     except asyncio.TimeoutError:
-        return f"asyncio.TimeoutError after {(time.monotonic() - start) * 1000:.0f} ms"
-    raise AssertionError("a limiter that never frees a slot returned anyway")
+        elapsed = time.monotonic() - start
+    else:
+        raise AssertionError("a limiter that never reserves a slot returned anyway")
+    if elapsed < 0.15:
+        raise AssertionError(f"wait() bounded acquire() after all: {elapsed:.3f}s")
+    return f"the limiter's 20 ms budget never fired; the caller's did at {elapsed * 1000:.0f} ms"
 
 
-@scenario("rate-limit", "clone() keeps the caller's type, including per-domain")
-async def rate_clone_type() -> str:
-    limiter: SyncRateLimiter = TokenBucket(rate=10.0, burst=1)
-    fresh = limiter.clone()
-    # acquire() and release() have to survive the clone, or the upgrade
-    # note's advice to hold a limiter as SyncRateLimiter would not work.
-    if not isinstance(fresh, TokenBucket):
-        raise AssertionError(f"clone returned {type(fresh).__name__}")
-    fresh.acquire()
-    fresh.release()
+@scenario("rate-limit", "a sync acquire() passes the ABC and fails on first use")
+async def rate_half_migrated_limiter() -> str:
+    """What a half-finished migration looks like, as a running program.
 
-    log: list[float] = []
-    async with _Server(_echo_app(log)) as site:
-        middleware = RateLimitMiddleware(TokenBucket(rate=50.0, burst=1), per_domain=True)
-        async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
-            async with session.get(f"{site.url}/x") as resp:
-                assert resp.status == 200
-        cloned = middleware._domain_limiters["127.0.0.1"]
-    if not isinstance(cloned, TokenBucket):
-        raise AssertionError(f"per-domain clone is {type(cloned).__name__}")
-    return "clone is a TokenBucket, with acquire() and release() intact"
+    ``acquire()`` is a coroutine now. The ABC checks names, not
+    awaitability, so a limiter left synchronous is built without complaint
+    and breaks at the first request with a ``TypeError`` from ``await``.
+    mypy is what catches it earlier: the ignore below is load-bearing under
+    ``--strict``, so if the override ever stops being an error, CI fails on
+    the unused ignore instead.
+    """
+
+    class NotMigrated(RateLimiter):
+        def acquire(self) -> float:  # type: ignore[override]
+            return 0.0
+
+        def clone(self) -> "NotMigrated":
+            return NotMigrated()
+
+    limiter = NotMigrated()  # the ABC is satisfied: both names are present
+    try:
+        await limiter.wait()
+    except TypeError as exc:
+        if "await" not in str(exc):
+            raise AssertionError(f"unhelpful error: {exc}") from None
+        return f"built without complaint, then TypeError: {exc}"
+    raise AssertionError("a synchronous acquire() was awaited without complaint")
 
 
 @scenario("rate-limit", "release() returns a slot cancelled mid-sleep")
 async def rate_release_on_cancel() -> str:
     bucket = TokenBucket(rate=5.0, burst=1)
-    bucket.acquire()  # drain the burst so the next caller must sleep
+    await bucket.acquire()  # drain the burst so the next caller must sleep
     task = asyncio.ensure_future(bucket.wait())
     await asyncio.sleep(0.05)
     task.cancel()
@@ -450,18 +543,61 @@ async def rate_release_on_cancel() -> str:
     if not task.cancelled():
         raise AssertionError("the wait was not cancelled")
     # The slot went back, so the next caller owes one interval, not two.
-    owed = bucket.acquire()
+    owed = await bucket.acquire()
     if owed > 0.25:
         raise AssertionError(f"slot was not returned: next caller owes {owed:.3f}s")
     return f"next caller owes {owed:.3f}s, not double"
 
 
+@scenario("rate-limit", "clone() builds a fresh limiter of the caller's own class")
+async def rate_clone_class() -> str:
+    """What ``clone()`` still promises, now that the annotation is the base.
+
+    ``RateLimiter.clone()`` returns ``RateLimiter``, so a caller holding the
+    base gets the base back and has to narrow it again -- ``typing_usage.py``
+    pins that half. At runtime the object is whatever the limiter's own
+    ``clone()`` built, including the one per-domain mode builds per host.
+    """
+    original = TokenBucket(rate=10.0, burst=1)
+    fresh = original.clone()
+    if not isinstance(fresh, TokenBucket):
+        raise AssertionError(f"clone returned a {type(fresh).__name__}")
+    if fresh is original:
+        raise AssertionError("clone returned the original limiter")
+
+    class Marked(RateLimiter):
+        """Counts how far from the template it is, so a copy cannot hide."""
+
+        def __init__(self, generation: int) -> None:
+            self.generation = generation
+
+        async def acquire(self) -> float:
+            return 0.0
+
+        def clone(self) -> "Marked":
+            return Marked(self.generation + 1)
+
+    template = Marked(0)
+    log: list[float] = []
+    async with _Server(_echo_app(log)) as site:
+        middleware = RateLimitMiddleware(template, per_domain=True)
+        async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
+            async with session.get(f"{site.url}/x") as resp:
+                assert resp.status == 200
+        cloned = middleware._domain_limiters["127.0.0.1"]
+    if not isinstance(cloned, Marked):
+        raise AssertionError(f"per-domain built a {type(cloned).__name__}")
+    if cloned is template or cloned.generation != 1:
+        raise AssertionError("per-domain did not go through the caller's clone()")
+    return "clone() is the caller's class, per host and by hand"
+
+
 @scenario("rate-limit", "clone() yields independent state")
 async def rate_clone_independent() -> str:
     original = TokenBucket(rate=10.0, burst=1)
-    original.acquire()  # drain it
+    await original.acquire()  # drain it
     fresh = original.clone()
-    if fresh.acquire() != 0.0:
+    if await fresh.acquire() != 0.0:
         raise AssertionError("the clone inherited the original's drained state")
     return "clone starts full"
 
