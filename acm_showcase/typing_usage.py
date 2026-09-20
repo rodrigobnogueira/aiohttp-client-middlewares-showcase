@@ -18,9 +18,9 @@ async def uses_the_whole_base_surface(limiter: RateLimiter) -> float:
     """Everything a caller can do holding nothing but the base class.
 
     ``acquire()`` is a coroutine returning ``float``, ``release()`` and
-    ``clone()`` are ordinary calls, and none of it needs narrowing.
+    ``clone(host)`` are ordinary calls, and none of it needs narrowing.
     """
-    fresh = limiter.clone()
+    fresh = limiter.clone("example.com")
     delay = await fresh.acquire()
     fresh.release()
     return delay
@@ -28,11 +28,11 @@ async def uses_the_whole_base_surface(limiter: RateLimiter) -> float:
 
 def concrete_stays_concrete(bucket: TokenBucket) -> TokenBucket:
     """``TokenBucket`` overrides ``clone()``, so its own type comes back."""
-    return bucket.clone()
+    return bucket.clone("example.com")
 
 
 def any_limiter(limiter: RateLimiter) -> RateLimiter:
-    return limiter.clone()
+    return limiter.clone("example.com")
 
 
 def clone_does_not_narrow(limiter: RateLimiter) -> TokenBucket:
@@ -43,12 +43,12 @@ def clone_does_not_narrow(limiter: RateLimiter) -> TokenBucket:
     assertion, not an escape: ``--strict`` reports an unused one, so this
     starts failing the day ``clone()`` narrows again.
     """
-    return limiter.clone()  # type: ignore[return-value]
+    return limiter.clone("example.com")  # type: ignore[return-value]
 
 
 def narrow_by_hand(limiter: RateLimiter) -> TokenBucket:
     """What a caller who wants the concrete type back has to write instead."""
-    fresh = limiter.clone()
+    fresh = limiter.clone("example.com")
     assert isinstance(fresh, TokenBucket)
     return fresh
 
@@ -62,7 +62,8 @@ class InMemoryAlgorithm(RateLimiter):
     async def acquire(self) -> float:
         return self._delay
 
-    def clone(self) -> "InMemoryAlgorithm":
+    def clone(self, host: str, /) -> "InMemoryAlgorithm":
+        # State lives on the object, so the host plays no part, as in TokenBucket.
         return InMemoryAlgorithm(self._delay)
 
 
@@ -77,8 +78,10 @@ class AwaitingAlgorithm(RateLimiter):
         await asyncio.sleep(0)
         return 0.0
 
-    def clone(self) -> "AwaitingAlgorithm":
-        return AwaitingAlgorithm(self._key)
+    def clone(self, host: str, /) -> "AwaitingAlgorithm":
+        # State lives in a backend, so the host goes into the key; without it
+        # every host would draw on one budget under per_domain=True.
+        return AwaitingAlgorithm(f"{self._key}:{host}")
 
 
 def middleware_accepts_both() -> tuple[RateLimitMiddleware, RateLimitMiddleware]:
@@ -87,6 +90,31 @@ def middleware_accepts_both() -> tuple[RateLimitMiddleware, RateLimitMiddleware]
         RateLimitMiddleware(InMemoryAlgorithm(0.0)),
         RateLimitMiddleware(AwaitingAlgorithm("k"), per_domain=True),
     )
+
+
+def host_is_positional_only(limiter: RateLimiter) -> RateLimiter:
+    """``host`` cannot be passed by name; the ignore is the assertion."""
+    return limiter.clone(host="example.com")  # type: ignore[call-arg]
+
+
+class NamesTheHost(RateLimiter):
+    """An override may name the parameter and drop the slash; mypy accepts it."""
+
+    async def acquire(self) -> float:
+        return 0.0
+
+    def clone(self, domain: str) -> "NamesTheHost":
+        return NamesTheHost()
+
+
+class OldSignature(RateLimiter):
+    """The host-less ``clone()`` no longer satisfies the base; the ignore is the assertion."""
+
+    async def acquire(self) -> float:
+        return 0.0
+
+    def clone(self) -> "OldSignature":  # type: ignore[override]
+        return OldSignature()
 
 
 async def awaits_through_the_base(limiter: RateLimiter) -> None:

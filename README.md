@@ -67,7 +67,8 @@ caller's own limiter being used rather than a copy; a limiter that is
 inherited unchanged from the base; an I/O-backed limiter that awaits a real
 HTTP round trip *inside* `acquire()` and is driven end to end through the
 middleware; the Redis sketch from the library's own docs run against a fake
-Redis; the timeout contract three ways — time spent acquiring charged against
+Redis, in global mode and then under `per_domain`, where `clone(host)` keys
+each host on the one backend; the timeout contract three ways — time spent acquiring charged against
 the caller's budget, a delay past that budget refused up front instead of
 slept, and a hanging `acquire()` that no timeout handed to `wait()` can stop;
 a half-migrated synchronous `acquire()` passing the ABC and failing on first

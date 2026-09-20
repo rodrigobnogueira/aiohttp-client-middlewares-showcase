@@ -235,6 +235,8 @@ async def rate_per_domain() -> str:
         # Assert the structure rather than the clock: connection latency to
         # "localhost" varies by host and would masquerade as throttling.
         buckets = middleware._domain_limiters
+        if buckets is None:
+            raise AssertionError("per_domain=True kept no per-host registry")
         if set(buckets) != {"127.0.0.1", "localhost"}:
             raise AssertionError(f"expected one bucket per host, got {sorted(buckets)}")
         if buckets["127.0.0.1"] is buckets["localhost"]:
@@ -265,7 +267,7 @@ async def rate_global_shared() -> str:
 async def rate_limiter_identity() -> str:
     bucket = TokenBucket(rate=100.0, burst=5)
     middleware = RateLimitMiddleware(bucket)
-    if middleware._global_limiter is not bucket:
+    if middleware._limiter is not bucket:
         raise AssertionError("the middleware substituted a different limiter")
     return "limiter used directly, not copied"
 
@@ -286,7 +288,7 @@ async def rate_custom_limiter() -> str:
             calls.append(None)
             return 0.0
 
-        def clone(self) -> "Recording":
+        def clone(self, host: str, /) -> "Recording":
             return Recording()
 
     for shared in ("wait", "release"):
@@ -337,7 +339,7 @@ async def rate_io_backed_acquire() -> str:
                 payload = await resp.json()
             return float(payload["delay"])
 
-        def clone(self) -> "RemoteQuota":
+        def clone(self, host: str, /) -> "RemoteQuota":
             return RemoteQuota(self._client, self._url)
 
     log: list[float] = []
@@ -361,40 +363,47 @@ async def rate_io_backed_acquire() -> str:
     return f"4 requests, 4 reservations over HTTP, {elapsed * 1000:.0f} ms"
 
 
+class FakeRedis:
+    """What the docs' Redis sketch relies on: keys, one atomic script, and a
+    delay in whole milliseconds, because Redis turns Lua numbers into integers
+    and a fractional second cannot come back as one."""
+
+    def __init__(self, interval_ms: int) -> None:
+        self._interval_ms = interval_ms
+        self._next: dict[str, float] = {}
+        self.reservations: list[tuple[str, int]] = []
+
+    @property
+    def evaluations(self) -> int:
+        return len(self.reservations)
+
+    async def evalsha(self, script: str, numkeys: int, key: str) -> int:
+        """Reserve the next slot for ``key`` and return its delay in ms."""
+        now = time.monotonic() * 1000
+        due = max(self._next.get(key, now), now)
+        self._next[key] = due + self._interval_ms
+        delay = int(due - now)
+        self.reservations.append((key, delay))
+        return delay
+
+
+class RedisLimiter(RateLimiter):
+    """The sketch from the library's docs, verbatim but for the fake."""
+
+    def __init__(self, redis: FakeRedis, key: str, script: str) -> None:
+        self._redis, self._key, self._script = redis, key, script
+
+    async def acquire(self) -> float:
+        ms = await self._redis.evalsha(self._script, 1, self._key)
+        return ms / 1000
+
+    def clone(self, host: str, /) -> "RedisLimiter":
+        return RedisLimiter(self._redis, f"{self._key}:{host}", self._script)
+
+
 @scenario("rate-limit", "the documented Redis sketch, against a fake Redis")
 async def rate_redis_sketch() -> str:
-    """The example from the docs, run rather than read.
-
-    The fake keeps what the sketch relies on: one key, one atomic script,
-    and a delay returned in whole milliseconds, because Redis turns Lua
-    numbers into integers and a fractional second cannot come back as one.
-    """
-
-    class FakeRedis:
-        def __init__(self, interval_ms: int) -> None:
-            self._interval_ms = interval_ms
-            self._next: dict[str, float] = {}
-            self.evaluations = 0
-
-        async def evalsha(self, script: str, numkeys: int, key: str) -> int:
-            """Reserve the next slot for ``key`` and return its delay in ms."""
-            self.evaluations += 1
-            now = time.monotonic() * 1000
-            due = max(self._next.get(key, now), now)
-            self._next[key] = due + self._interval_ms
-            return int(due - now)
-
-    class RedisLimiter(RateLimiter):
-        def __init__(self, redis: FakeRedis, key: str, script: str) -> None:
-            self._redis, self._key, self._script = redis, key, script
-
-        async def acquire(self) -> float:
-            ms = await self._redis.evalsha(self._script, 1, self._key)
-            return ms / 1000
-
-        def clone(self) -> "RedisLimiter":
-            return RedisLimiter(self._redis, self._key, self._script)
-
+    """The example from the docs, run rather than read, in global mode."""
     redis = FakeRedis(interval_ms=50)
     log: list[float] = []
     async with _Server(_echo_app(log)) as site:
@@ -414,6 +423,33 @@ async def rate_redis_sketch() -> str:
     return f"4 requests in {elapsed * 1000:.0f} ms, {redis.evaluations} reservations"
 
 
+@scenario("rate-limit", "per_domain with a shared backend keys each host")
+async def rate_redis_per_domain() -> str:
+    """What ``clone(host)`` is for: one backend, one budget per host.
+
+    A limiter whose state lives in Redis has nothing per object to keep
+    apart, so ``per_domain=True`` only means a budget per host if the clone
+    it builds puts the host in its key. The sketch does: two hosts that are
+    the same server reserve under two keys, and each gets its first slot
+    free instead of the second waiting an interval behind the first.
+    """
+    redis = FakeRedis(interval_ms=50)
+    log: list[float] = []
+    async with _Server(_echo_app(log)) as site:
+        port = site.url.rsplit(":", 1)[1]
+        urls = (f"http://127.0.0.1:{port}/x", f"http://localhost:{port}/x")
+        template = RedisLimiter(redis, "rate:showcase", "deadbeef")
+        middleware = RateLimitMiddleware(template, per_domain=True)
+        async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
+            for url in urls:
+                async with session.get(url) as resp:
+                    assert resp.status == 200
+    expected = [("rate:showcase:127.0.0.1", 0), ("rate:showcase:localhost", 0)]
+    if redis.reservations != expected:
+        raise AssertionError(f"expected one free slot per host key, saw {redis.reservations}")
+    return "2 hosts, 2 keys on one backend, both first slots free"
+
+
 @scenario("rate-limit", "time spent in acquire() is charged against the timeout")
 async def rate_acquire_charged() -> str:
     """A slow reservation spends the caller's budget, and ``wait()`` counts it.
@@ -429,7 +465,7 @@ async def rate_acquire_charged() -> str:
             await asyncio.sleep(0.05)
             return 0.06
 
-        def clone(self) -> "SlowReservation":
+        def clone(self, host: str, /) -> "SlowReservation":
             return SlowReservation()
 
     start = time.monotonic()
@@ -488,7 +524,7 @@ async def rate_acquire_is_unbounded() -> str:
             await asyncio.Event().wait()
             return 0.0
 
-        def clone(self) -> "NeverAnswers":
+        def clone(self, host: str, /) -> "NeverAnswers":
             return NeverAnswers()
 
     start = time.monotonic()
@@ -519,7 +555,7 @@ async def rate_half_migrated_limiter() -> str:
         def acquire(self) -> float:  # type: ignore[override]
             return 0.0
 
-        def clone(self) -> "NotMigrated":
+        def clone(self, host: str, /) -> "NotMigrated":
             return NotMigrated()
 
     limiter = NotMigrated()  # the ABC is satisfied: both names are present
@@ -559,7 +595,7 @@ async def rate_clone_class() -> str:
     ``clone()`` built, including the one per-domain mode builds per host.
     """
     original = TokenBucket(rate=10.0, burst=1)
-    fresh = original.clone()
+    fresh = original.clone("example.com")
     if not isinstance(fresh, TokenBucket):
         raise AssertionError(f"clone returned a {type(fresh).__name__}")
     if fresh is original:
@@ -574,7 +610,7 @@ async def rate_clone_class() -> str:
         async def acquire(self) -> float:
             return 0.0
 
-        def clone(self) -> "Marked":
+        def clone(self, host: str, /) -> "Marked":
             return Marked(self.generation + 1)
 
     template = Marked(0)
@@ -584,7 +620,10 @@ async def rate_clone_class() -> str:
         async with aiohttp.ClientSession(middlewares=(middleware,)) as session:
             async with session.get(f"{site.url}/x") as resp:
                 assert resp.status == 200
-        cloned = middleware._domain_limiters["127.0.0.1"]
+        limiters = middleware._domain_limiters
+        if limiters is None:
+            raise AssertionError("per_domain=True kept no per-host registry")
+        cloned = limiters["127.0.0.1"]
     if not isinstance(cloned, Marked):
         raise AssertionError(f"per-domain built a {type(cloned).__name__}")
     if cloned is template or cloned.generation != 1:
@@ -596,7 +635,7 @@ async def rate_clone_class() -> str:
 async def rate_clone_independent() -> str:
     original = TokenBucket(rate=10.0, burst=1)
     await original.acquire()  # drain it
-    fresh = original.clone()
+    fresh = original.clone("example.com")
     if await fresh.acquire() != 0.0:
         raise AssertionError("the clone inherited the original's drained state")
     return "clone starts full"
